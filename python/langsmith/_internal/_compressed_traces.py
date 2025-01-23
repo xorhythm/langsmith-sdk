@@ -1,5 +1,4 @@
 import io
-import threading
 
 from zstandard import ZstdCompressor  # type: ignore[import]
 
@@ -12,7 +11,6 @@ class CompressedTraces:
     def __init__(self):
         self.buffer = io.BytesIO()
         self.trace_count = 0
-        self.lock = threading.Lock()
         self.uncompressed_size = 0
 
         self.compressor_writer = ZstdCompressor(
