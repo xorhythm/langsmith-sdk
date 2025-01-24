@@ -490,7 +490,8 @@ async def _abackground_send_compressed_traces(async_client: AsyncClient):
     size_limit: int = batch_ingest_config["size_limit"]
     size_limit_bytes = batch_ingest_config.get("size_limit_bytes", 20_971_520)
     while True:
-        # Python 3.13, asyncio.wait no longer allows passing coroutines directly as arguments
+        # Python 3.13, asyncio.wait no longer allows passing coroutines directly as
+        # arguments
         data_available_task = asyncio.create_task(
             async_client._data_available_event.wait()
         )

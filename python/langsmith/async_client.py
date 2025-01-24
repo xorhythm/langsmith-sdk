@@ -72,6 +72,7 @@ class AsyncClient:
         retry_config: Optional[Mapping[str, Any]] = None,
         info: Optional[Union[dict, ls_schemas.LangSmithInfo]] = None,
         web_url: Optional[str] = None,
+        auto_batch_tracing: bool = False,
     ):
         """Initialize the async client."""
         ls_beta._warn_once("Class AsyncClient is in beta.")
@@ -102,7 +103,7 @@ class AsyncClient:
         self._exit_background_send_event: Optional[asyncio.Event] = None
         self._background_send_task: Optional[asyncio.Task] = None
         # TODO: bring it inline with default compression in the blocking Client
-        if ls_utils.get_env_var("USE_RUN_COMPRESSION"):
+        if auto_batch_tracing or ls_utils.get_env_var("USE_RUN_COMPRESSION"):
             self.compressed_traces = CompressedTraces()
             self._compressed_traces_lock = asyncio.Lock()
             self._data_available_event = asyncio.Event()
