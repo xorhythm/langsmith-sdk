@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import time
 import uuid
 
 import pytest
@@ -119,7 +120,7 @@ async def test_create_run(async_client: AsyncClient):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_client_with_compression", [1], indirect=True)
 async def test_create_compressed_run(async_client_with_compression: AsyncClient):
-    project_name = "__test_create_run" + uuid.uuid4().hex[:8]
+    project_name = "__test_create_compressed_run" + uuid.uuid4().hex[:8]
 
     run_id = uuid.uuid4()
 
@@ -149,6 +150,105 @@ async def test_create_compressed_run(async_client_with_compression: AsyncClient)
     run = await async_client_with_compression.read_run(run_id)
     assert run.name == "test_compressed_run"
     assert run.inputs == {"input": "hello"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_client_with_compression", [3], indirect=True)
+async def test_create_multiple_compressed_runs(
+    async_client_with_compression: AsyncClient,
+):
+    # TODO: set up and assertions are very much duplicated from test_batch_ingest_runs
+    _session = "__test_create_multiple_compressed_runs" + uuid.uuid4().hex[:8]
+    trace_id = uuid.uuid4()
+    trace_id_2 = uuid.uuid4()
+    run_id_2 = uuid.uuid4()
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+    later_time = (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+    ).strftime("%Y%m%dT%H%M%S%fZ")
+
+    """
+    Here we create:
+    - run 1: a top level trace with inputs and outputs
+    - run 3: a top level trace with an error with inputs and outputs
+    - run 2: a child of run 1 with inputs, no outputs
+    """
+
+    runs_to_create = [
+        {
+            "id": str(trace_id),
+            "session_name": _session,
+            "name": "run 1",
+            "run_type": "chain",
+            "dotted_order": f"{current_time}{str(trace_id)}",
+            "trace_id": str(trace_id),
+            "inputs": {"input1": 1, "input2": 2},
+            "outputs": {"output1": 3, "output2": 4},
+        },
+        {
+            "id": str(trace_id_2),
+            "session_name": _session,
+            "name": "run 3",
+            "run_type": "chain",
+            "dotted_order": f"{current_time}{str(trace_id_2)}",
+            "trace_id": str(trace_id_2),
+            "inputs": {"input1": 1, "input2": 2},
+            "outputs": {"output1": 3, "output2": 4},
+            "error": "error",
+        },
+        {
+            "id": str(run_id_2),
+            "session_name": _session,
+            "name": "run 2",
+            "run_type": "chain",
+            "dotted_order": f"{current_time}{str(trace_id)}."
+            f"{later_time}{str(run_id_2)}",
+            "trace_id": str(trace_id),
+            "parent_run_id": str(trace_id),
+            "inputs": {"input1": 5, "input2": 6},
+        },
+    ]
+
+    for run in runs_to_create:
+        await async_client_with_compression.create_run(**run)
+
+    wait = 4
+    for _ in range(15):
+        try:
+            runs = []
+            async for run in async_client_with_compression.list_runs(
+                project_name=_session,
+                run_ids=[str(trace_id), str(run_id_2), str(trace_id_2)],
+            ):
+                runs.append(run)
+
+            if len(runs) == 3:
+                break
+
+            raise ls_utils.LangSmithError("Runs not created yet")
+        except ls_utils.LangSmithError:
+            time.sleep(wait)
+            wait += 1
+    else:
+        raise ValueError("Runs not created in time")
+    assert len(runs) == 3
+
+    # Assert inputs and outputs of run 1
+    run1 = next(run for run in runs if run.id == trace_id)
+    assert run1.inputs == {"input1": 1, "input2": 2}
+    assert run1.outputs == {"output1": 3, "output2": 4}
+
+    # Assert inputs of run 2
+    run2 = next(run for run in runs if run.id == run_id_2)
+    assert run2.inputs == {"input1": 5, "input2": 6}
+
+    # Assert inputs and outputs of run 3
+    run3 = next(run for run in runs if run.id == trace_id_2)
+    assert run3.inputs == {"input1": 1, "input2": 2}
+    assert run1.outputs == {"output1": 3, "output2": 4}
+    assert run3.error == "error"
 
 
 @pytest.mark.asyncio
