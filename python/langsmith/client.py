@@ -381,6 +381,7 @@ class Client:
         "_manual_cleanup",
         "_pyo3_client",
         "compressed_traces",
+        "_compressed_traces_lock",
         "_data_available_event",
         "_futures",
     ]
@@ -473,6 +474,7 @@ class Client:
         # Create a session and register a finalizer to close it
         session_ = session if session else requests.Session()
         self.session = session_
+
         self._info = (
             info
             if info is None or isinstance(info, ls_schemas.LangSmithInfo)
@@ -481,6 +483,7 @@ class Client:
         weakref.finalize(self, close_session, self.session)
         atexit.register(close_session, session_)
         self.compressed_traces: Optional[CompressedTraces] = None
+        self._compressed_traces_lock: Optional[threading.Lock] = None
         self._data_available_event: Optional[threading.Event] = None
         self._futures: Optional[set[cf.Future]] = None
         # Initialize auto batching
@@ -1291,7 +1294,7 @@ class Client:
                         serialized_op
                     )
                 )
-                with self.compressed_traces.lock:
+                with self._compressed_traces_lock:
                     compress_multipart_parts_and_context(
                         multipart_form,
                         self.compressed_traces,
@@ -2021,11 +2024,13 @@ class Client:
                         serialized_op
                     )
                 )
-                with self.compressed_traces.lock:
+
+                with self._compressed_traces_lock:
                     if self._data_available_event is None:
                         raise ValueError(
                             "Run compression is enabled but threading event is not configured"
                         )
+
                     compress_multipart_parts_and_context(
                         multipart_form,
                         self.compressed_traces,
@@ -5311,7 +5316,7 @@ class Client:
                             serialized_op
                         )
                     )
-                    with self.compressed_traces.lock:
+                    with self._compressed_traces_lock:
                         compress_multipart_parts_and_context(
                             multipart_form,
                             self.compressed_traces,

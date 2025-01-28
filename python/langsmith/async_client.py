@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import io
+import logging
+import traceback
 import uuid
 from typing import (
     Any,
@@ -18,12 +21,27 @@ from typing import (
     cast,
 )
 
+import aiofiles
 import httpx
 
 from langsmith import client as ls_client
 from langsmith import schemas as ls_schemas
 from langsmith import utils as ls_utils
 from langsmith._internal import _beta_decorator as ls_beta
+from langsmith._internal._background_thread import (
+    _abackground_send_compressed_traces,
+)
+from langsmith._internal._compressed_traces import CompressedTraces
+from langsmith._internal._constants import (
+    _BOUNDARY,
+)
+from langsmith._internal._operations import (
+    acompress_multipart_parts_and_context,
+    aserialized_run_operation_to_multipart_parts_and_context,
+    serialize_run_dict,
+)
+
+logger = logging.getLogger(__name__)
 
 ID_TYPE = Union[uuid.UUID, str]
 
@@ -31,7 +49,17 @@ ID_TYPE = Union[uuid.UUID, str]
 class AsyncClient:
     """Async Client for interacting with the LangSmith API."""
 
-    __slots__ = ("_retry_config", "_client", "_web_url")
+    __slots__ = (
+        "_retry_config",
+        "_client",
+        "_web_url",
+        "compressed_traces",
+        "_compressed_traces_lock",
+        "_data_available_event",
+        "_exit_background_send_event",
+        "_background_send_task",
+        "info",
+    )
 
     def __init__(
         self,
@@ -44,6 +72,9 @@ class AsyncClient:
         ] = None,
         retry_config: Optional[Mapping[str, Any]] = None,
         web_url: Optional[str] = None,
+        *,
+        info: Optional[Union[dict, ls_schemas.LangSmithInfo]] = None,
+        auto_batch_tracing: bool = True,
     ):
         """Initialize the async client."""
         ls_beta._warn_once("Class AsyncClient is in beta.")
@@ -68,6 +99,23 @@ class AsyncClient:
         )
         self._web_url = web_url
 
+        self.compressed_traces: Optional[CompressedTraces] = None
+        self._compressed_traces_lock: Optional[asyncio.Lock] = None
+        self._data_available_event: Optional[asyncio.Event] = None
+        self._exit_background_send_event: Optional[asyncio.Event] = None
+        self._background_send_task: Optional[asyncio.Task] = None
+        if auto_batch_tracing:
+            self.compressed_traces = CompressedTraces()
+            self._compressed_traces_lock = asyncio.Lock()
+            self._data_available_event = asyncio.Event()
+            self._exit_background_send_event = asyncio.Event()
+            self._background_send_task = asyncio.create_task(
+                _abackground_send_compressed_traces(async_client=self)
+            )
+
+        # TODO - proper handling via property or fetching from backend as well (see sync client calling /info)
+        self.info = info
+
     async def __aenter__(self) -> AsyncClient:
         """Enter the async client."""
         return self
@@ -79,6 +127,9 @@ class AsyncClient:
     async def aclose(self):
         """Close the async client."""
         await self._client.aclose()
+        if self._background_send_task is not None:
+            self._exit_background_send_event.set()
+            await self._background_send_task
 
     @property
     def _api_url(self):
@@ -93,10 +144,13 @@ class AsyncClient:
         self,
         method: str,
         endpoint: str,
+        stop_after_attempt: Union[int, None] = None,
         **kwargs: Any,
     ) -> httpx.Response:
         """Make an async HTTP request with retries."""
-        max_retries = cast(int, self._retry_config.get("max_retries", 3))
+        max_retries = stop_after_attempt or cast(
+            int, self._retry_config.get("max_retries", 3)
+        )
 
         # Python requests library used by the normal Client filters out params with None values
         # The httpx library does not. Filter them out here to keep behavior consistent
@@ -121,6 +175,62 @@ class AsyncClient:
         raise ls_utils.LangSmithAPIError(
             "Unexpected error connecting to the LangSmith API"
         )
+
+    async def _asend_compressed_multipart_req(
+        self,
+        data_stream: io.BytesIO,
+        compressed_traces_info: Optional[Tuple[int, int]],
+        *,
+        attempts: int = 3,
+    ):
+        """Send a zstd-compressed multipart form data stream to the backend."""
+        data_stream.seek(0)
+
+        for idx in range(1, attempts + 1):
+            try:
+                headers = {
+                    "Content-Type": f"multipart/form-data; boundary={_BOUNDARY}",
+                    "Content-Encoding": "zstd",
+                    "X-Pre-Compressed-Size": (
+                        str(compressed_traces_info[0]) if compressed_traces_info else ""
+                    ),
+                    "X-Post-Compressed-Size": (
+                        str(compressed_traces_info[1]) if compressed_traces_info else ""
+                    ),
+                }
+
+                await self._arequest_with_retries(
+                    method="POST",
+                    endpoint="/runs/multipart",
+                    stop_after_attempt=1,
+                    content=data_stream.read(),
+                    headers=headers,
+                )
+                break
+            except ls_utils.LangSmithConflictError:
+                break
+            except (
+                ls_utils.LangSmithConnectionError,
+                ls_utils.LangSmithRequestTimeout,
+                ls_utils.LangSmithAPIError,
+            ) as exc:
+                if idx == attempts:
+                    logger.warning(f"Failed to send compressed multipart ingest: {exc}")
+                else:
+                    continue
+            except Exception as e:
+                try:
+                    exc_desc_lines = traceback.format_exception_only(type(e), e)
+                    exc_desc = "".join(exc_desc_lines).rstrip()
+                    logger.warning(
+                        f"Failed to send compressed multipart ingest: {exc_desc}"
+                    )
+                except Exception:
+                    logger.warning(
+                        f"Failed to send compressed multipart ingest: {repr(e)}"
+                    )
+                # Do not retry by default after unknown exceptions
+                return
 
     async def _aget_paginated_list(
         self,
@@ -193,6 +303,40 @@ class AsyncClient:
             "revision_id": revision_id,
             **kwargs,
         }
+
+        if (
+            # batch ingest requires trace_id and dotted_order to be set
+            run_create.get("trace_id") is not None
+            and run_create.get("dotted_order") is not None
+            and self.compressed_traces is not None
+        ):
+            serialized_op = serialize_run_dict("post", run_create)
+
+            try:
+                (
+                    multipart_form,
+                    opened_files,
+                ) = await aserialized_run_operation_to_multipart_parts_and_context(
+                    serialized_op
+                )
+                async with self._compressed_traces_lock:
+                    await acompress_multipart_parts_and_context(
+                        multipart_form,
+                        self.compressed_traces,
+                        _BOUNDARY,
+                    )
+                    self.compressed_traces.trace_count += 1
+                    self._data_available_event.set()
+            except Exception as e:
+                raise ls_utils.LangSmithError(
+                    f"Failed to create run {name}: {run_create.id}. {repr(e)}"
+                )
+            finally:
+                await _close_files(opened_files)
+        else:
+            await self._create_run(run_create)
+
+    async def _create_run(self, run_create: dict):
         await self._arequest_with_retries(
             "POST", "/runs", content=ls_client._dumps_json(run_create)
         )
@@ -1170,3 +1314,13 @@ class AsyncClient:
         for ex in resp.json()["examples"]:
             examples.append(ls_schemas.ExampleSearch(**ex, dataset_id=dataset_id))
         return examples
+
+
+async def _close_files(files: List[aiofiles.AsyncBufferedReader]) -> None:
+    """Close all opened files used in multipart requests."""
+    for file in files:
+        try:
+            await file.close()
+        except Exception:
+            logger.debug("Could not close file: %s", file.name)
+            pass

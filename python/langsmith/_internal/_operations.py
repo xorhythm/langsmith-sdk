@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import itertools
 import logging
 import os
 import uuid
 from io import BufferedReader
 from typing import Dict, Iterable, Literal, Optional, Tuple, Union, cast
+
+import aiofiles
 
 from langsmith import schemas as ls_schemas
 from langsmith._internal import _orjson
@@ -212,11 +215,10 @@ def serialized_feedback_operation_to_multipart_parts_and_context(
     )
 
 
-def serialized_run_operation_to_multipart_parts_and_context(
+def _serialized_run_operation_to_main_multipart_parts(
     op: SerializedRunOperation,
-) -> tuple[MultipartPartsAndContext, Dict[str, BufferedReader]]:
+) -> list[MultipartPart]:
     acc_parts: list[MultipartPart] = []
-    opened_files_dict: Dict[str, BufferedReader] = {}
     # this is main object, minus inputs/outputs/events/attachments
     acc_parts.append(
         (
@@ -248,15 +250,27 @@ def serialized_run_operation_to_multipart_parts_and_context(
                 ),
             ),
         )
+    return acc_parts
+
+
+def _warn_invalid_attachment(n: str, op: SerializedRunOperation):
+    logger.warning(
+        f"Skipping logging of attachment '{n}' "
+        f"for run {op.id}:"
+        " Invalid attachment name.  Attachment names must not contain"
+        " periods ('.'). Please rename the attachment and try again."
+    )
+
+
+def serialized_run_operation_to_multipart_parts_and_context(
+    op: SerializedRunOperation,
+) -> tuple[MultipartPartsAndContext, Dict[str, BufferedReader]]:
+    acc_parts = _serialized_run_operation_to_main_multipart_parts(op)
+    opened_files_dict: Dict[str, BufferedReader] = {}
     if op.attachments:
         for n, (content_type, data_or_path) in op.attachments.items():
             if "." in n:
-                logger.warning(
-                    f"Skipping logging of attachment '{n}' "
-                    f"for run {op.id}:"
-                    " Invalid attachment name.  Attachment names must not contain"
-                    " periods ('.'). Please rename the attachment and try again."
-                )
+                _warn_invalid_attachment(n, op)
                 continue
 
             if isinstance(data_or_path, bytes):
@@ -292,10 +306,54 @@ def serialized_run_operation_to_multipart_parts_and_context(
     )
 
 
+async def aserialized_run_operation_to_multipart_parts_and_context(
+    op: SerializedRunOperation,
+) -> tuple[MultipartPartsAndContext, Dict[str, aiofiles.AsyncBufferedReader]]:
+    acc_parts = _serialized_run_operation_to_main_multipart_parts(op)
+    opened_files_dict: Dict[str, aiofiles.AsyncBufferedReader] = {}
+    if op.attachments:
+        for n, (content_type, data_or_path) in op.attachments.items():
+            if "." in n:
+                _warn_invalid_attachment(n, op)
+                continue
+
+            if isinstance(data_or_path, bytes):
+                acc_parts.append(
+                    (
+                        f"attachment.{op.id}.{n}",
+                        (
+                            None,
+                            data_or_path,
+                            content_type,
+                            {"Content-Length": str(len(data_or_path))},
+                        ),
+                    )
+                )
+            else:
+                file_size = await aiofiles.os.path.getsize(data_or_path)
+                file = await aiofiles.open(data_or_path, "rb")
+                opened_files_dict[str(data_or_path) + str(uuid.uuid4())] = file
+                acc_parts.append(
+                    (
+                        f"attachment.{op.id}.{n}",
+                        (
+                            None,
+                            file,
+                            f"{content_type}; length={file_size}",
+                            {},
+                        ),
+                    )
+                )
+    return (
+        MultipartPartsAndContext(acc_parts, f"trace={op.trace_id},id={op.id}"),
+        opened_files_dict,
+    )
+
+
 def encode_multipart_parts_and_context(
     parts_and_context: MultipartPartsAndContext,
     boundary: str,
-) -> Iterable[Tuple[bytes, Union[bytes, BufferedReader]]]:
+) -> Iterable[Tuple[bytes, bytes]]:
     for part_name, (filename, data, content_type, headers) in parts_and_context.parts:
         header_parts = [
             f"--{boundary}\r\n",
@@ -313,7 +371,16 @@ def encode_multipart_parts_and_context(
             ]
         )
 
-        yield ("".join(header_parts).encode(), data)
+        header_data = "".join(header_parts).encode()
+
+        if isinstance(data, (bytes, bytearray)):
+            yield (header_data, data)
+        else:
+            if isinstance(data, BufferedReader):
+                encoded_data = data.read()
+            else:
+                encoded_data = str(data).encode()
+            yield (header_data, encoded_data)
 
 
 def compress_multipart_parts_and_context(
@@ -326,16 +393,25 @@ def compress_multipart_parts_and_context(
     ):
         compressed_traces.compressor_writer.write(headers)
 
-        if isinstance(data, (bytes, bytearray)):
-            compressed_traces.uncompressed_size += len(data)
-            compressed_traces.compressor_writer.write(data)
-        else:
-            if isinstance(data, BufferedReader):
-                encoded_data = data.read()
-            else:
-                encoded_data = str(data).encode()
-            compressed_traces.uncompressed_size += len(encoded_data)
-            compressed_traces.compressor_writer.write(encoded_data)
+        compressed_traces.uncompressed_size += len(data)
+        compressed_traces.compressor_writer.write(data)
 
         # Write part terminator
         compressed_traces.compressor_writer.write(b"\r\n")
+
+
+async def acompress_multipart_parts_and_context(
+    parts_and_context: MultipartPartsAndContext,
+    compressed_traces: CompressedTraces,
+    boundary: str,
+) -> None:
+    for headers, data in encode_multipart_parts_and_context(
+        parts_and_context, boundary
+    ):
+        await asyncio.to_thread(compressed_traces.compressor_writer.write, headers)
+
+        compressed_traces.uncompressed_size += len(data)
+        await asyncio.to_thread(compressed_traces.compressor_writer.write, data)
+
+        # Write part terminator
+        await asyncio.to_thread(compressed_traces.compressor_writer.write, b"\r\n")
