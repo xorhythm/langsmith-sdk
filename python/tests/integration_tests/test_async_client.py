@@ -65,7 +65,7 @@ async def wait_for(condition, timeout=10):
 @pytest.fixture
 async def async_client():
     ls_utils.get_env_var.cache_clear()
-    client = AsyncClient()
+    client = AsyncClient(auto_batch_tracing=False)
     yield client
     await client.aclose()
 
@@ -74,20 +74,19 @@ async def async_client():
 async def async_client_with_compression(request):
     compress_size_limit = request.param
     ls_utils.get_env_var.cache_clear()
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setenv("LANGSMITH_USE_RUN_COMPRESSION", "true")
-        client = AsyncClient(
-            info=ls_schemas.LangSmithInfo(
-                batch_ingest_config=ls_schemas.BatchIngestConfig(
-                    use_multipart_endpoint=False,
-                    size_limit_bytes=None,  # Note this field is not used here
-                    size_limit=compress_size_limit,
-                    # ignoring other settings here (not used by AsyncClient)
-                )
+    client = AsyncClient(
+        info=ls_schemas.LangSmithInfo(
+            batch_ingest_config=ls_schemas.BatchIngestConfig(
+                use_multipart_endpoint=False,
+                size_limit_bytes=None,  # Note this field is not used here
+                size_limit=compress_size_limit,
+                # ignoring other settings here (not used by AsyncClient)
             )
-        )
-        yield client
-        await client.aclose()
+        ),
+        auto_batch_tracing=True,
+    )
+    yield client
+    await client.aclose()
 
 
 @pytest.mark.asyncio

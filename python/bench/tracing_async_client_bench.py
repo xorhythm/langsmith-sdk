@@ -42,10 +42,10 @@ async def benchmark_run_creation(
             for run in runs:
                 await client.create_run(**run, project_name=project_name)
 
-            elapsed = time.perf_counter() - start
-
-            timings.append(elapsed)
             await client.aclose()
+
+            elapsed = time.perf_counter() - start
+            timings.append(elapsed)
 
     return {
         "mean": statistics.mean(timings),

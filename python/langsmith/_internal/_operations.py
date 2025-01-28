@@ -8,6 +8,8 @@ import uuid
 from io import BufferedReader
 from typing import Dict, Iterable, Literal, Optional, Tuple, Union, cast
 
+import aiofiles
+
 from langsmith import schemas as ls_schemas
 from langsmith._internal import _orjson
 from langsmith._internal._compressed_traces import CompressedTraces
@@ -213,11 +215,10 @@ def serialized_feedback_operation_to_multipart_parts_and_context(
     )
 
 
-def serialized_run_operation_to_multipart_parts_and_context(
+def _serialized_run_operation_to_main_multipart_parts(
     op: SerializedRunOperation,
-) -> tuple[MultipartPartsAndContext, Dict[str, BufferedReader]]:
+) -> list[MultipartPart]:
     acc_parts: list[MultipartPart] = []
-    opened_files_dict: Dict[str, BufferedReader] = {}
     # this is main object, minus inputs/outputs/events/attachments
     acc_parts.append(
         (
@@ -249,15 +250,27 @@ def serialized_run_operation_to_multipart_parts_and_context(
                 ),
             ),
         )
+    return acc_parts
+
+
+def _warn_invalid_attachment(n: str, op: SerializedRunOperation):
+    logger.warning(
+        f"Skipping logging of attachment '{n}' "
+        f"for run {op.id}:"
+        " Invalid attachment name.  Attachment names must not contain"
+        " periods ('.'). Please rename the attachment and try again."
+    )
+
+
+def serialized_run_operation_to_multipart_parts_and_context(
+    op: SerializedRunOperation,
+) -> tuple[MultipartPartsAndContext, Dict[str, BufferedReader]]:
+    acc_parts = _serialized_run_operation_to_main_multipart_parts(op)
+    opened_files_dict: Dict[str, BufferedReader] = {}
     if op.attachments:
         for n, (content_type, data_or_path) in op.attachments.items():
             if "." in n:
-                logger.warning(
-                    f"Skipping logging of attachment '{n}' "
-                    f"for run {op.id}:"
-                    " Invalid attachment name.  Attachment names must not contain"
-                    " periods ('.'). Please rename the attachment and try again."
-                )
+                _warn_invalid_attachment(n, op)
                 continue
 
             if isinstance(data_or_path, bytes):
@@ -275,6 +288,50 @@ def serialized_run_operation_to_multipart_parts_and_context(
             else:
                 file_size = os.path.getsize(data_or_path)
                 file = open(data_or_path, "rb")
+                opened_files_dict[str(data_or_path) + str(uuid.uuid4())] = file
+                acc_parts.append(
+                    (
+                        f"attachment.{op.id}.{n}",
+                        (
+                            None,
+                            file,
+                            f"{content_type}; length={file_size}",
+                            {},
+                        ),
+                    )
+                )
+    return (
+        MultipartPartsAndContext(acc_parts, f"trace={op.trace_id},id={op.id}"),
+        opened_files_dict,
+    )
+
+
+async def aserialized_run_operation_to_multipart_parts_and_context(
+    op: SerializedRunOperation,
+) -> tuple[MultipartPartsAndContext, Dict[str, aiofiles.AsyncBufferedReader]]:
+    acc_parts = _serialized_run_operation_to_main_multipart_parts(op)
+    opened_files_dict: Dict[str, aiofiles.AsyncBufferedReader] = {}
+    if op.attachments:
+        for n, (content_type, data_or_path) in op.attachments.items():
+            if "." in n:
+                _warn_invalid_attachment(n, op)
+                continue
+
+            if isinstance(data_or_path, bytes):
+                acc_parts.append(
+                    (
+                        f"attachment.{op.id}.{n}",
+                        (
+                            None,
+                            data_or_path,
+                            content_type,
+                            {"Content-Length": str(len(data_or_path))},
+                        ),
+                    )
+                )
+            else:
+                file_size = await aiofiles.os.path.getsize(data_or_path)
+                file = await aiofiles.open(data_or_path, "rb")
                 opened_files_dict[str(data_or_path) + str(uuid.uuid4())] = file
                 acc_parts.append(
                     (

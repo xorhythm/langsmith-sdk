@@ -21,6 +21,7 @@ from typing import (
     cast,
 )
 
+import aiofiles
 import httpx
 
 from langsmith import client as ls_client
@@ -36,8 +37,8 @@ from langsmith._internal._constants import (
 )
 from langsmith._internal._operations import (
     acompress_multipart_parts_and_context,
+    aserialized_run_operation_to_multipart_parts_and_context,
     serialize_run_dict,
-    serialized_run_operation_to_multipart_parts_and_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,9 +71,10 @@ class AsyncClient:
             ]
         ] = None,
         retry_config: Optional[Mapping[str, Any]] = None,
-        info: Optional[Union[dict, ls_schemas.LangSmithInfo]] = None,
         web_url: Optional[str] = None,
-        auto_batch_tracing: bool = False,
+        *,
+        info: Optional[Union[dict, ls_schemas.LangSmithInfo]] = None,
+        auto_batch_tracing: bool = True,
     ):
         """Initialize the async client."""
         ls_beta._warn_once("Class AsyncClient is in beta.")
@@ -102,8 +104,7 @@ class AsyncClient:
         self._data_available_event: Optional[asyncio.Event] = None
         self._exit_background_send_event: Optional[asyncio.Event] = None
         self._background_send_task: Optional[asyncio.Task] = None
-        # TODO: bring it inline with default compression in the blocking Client
-        if auto_batch_tracing or ls_utils.get_env_var("USE_RUN_COMPRESSION"):
+        if auto_batch_tracing:
             self.compressed_traces = CompressedTraces()
             self._compressed_traces_lock = asyncio.Lock()
             self._data_available_event = asyncio.Event()
@@ -310,20 +311,28 @@ class AsyncClient:
             and self.compressed_traces is not None
         ):
             serialized_op = serialize_run_dict("post", run_create)
-            multipart_form, opened_files = (
-                serialized_run_operation_to_multipart_parts_and_context(serialized_op)
-            )
 
-            async with self._compressed_traces_lock:
-                await acompress_multipart_parts_and_context(
+            try:
+                (
                     multipart_form,
-                    self.compressed_traces,
-                    _BOUNDARY,
+                    opened_files,
+                ) = await aserialized_run_operation_to_multipart_parts_and_context(
+                    serialized_op
                 )
-                self.compressed_traces.trace_count += 1
-                self._data_available_event.set()
-
-            ls_client._close_files(opened_files)
+                async with self._compressed_traces_lock:
+                    await acompress_multipart_parts_and_context(
+                        multipart_form,
+                        self.compressed_traces,
+                        _BOUNDARY,
+                    )
+                    self.compressed_traces.trace_count += 1
+                    self._data_available_event.set()
+            except Exception as e:
+                raise ls_utils.LangSmithError(
+                    f"Failed to create run {name}: {run_create.id}. {repr(e)}"
+                )
+            finally:
+                await _close_files(opened_files)
         else:
             await self._create_run(run_create)
 
@@ -1305,3 +1314,13 @@ class AsyncClient:
         for ex in resp.json()["examples"]:
             examples.append(ls_schemas.ExampleSearch(**ex, dataset_id=dataset_id))
         return examples
+
+
+async def _close_files(files: List[aiofiles.AsyncBufferedReader]) -> None:
+    """Close all opened files used in multipart requests."""
+    for file in files:
+        try:
+            await file.close()
+        except Exception:
+            logger.debug("Could not close file: %s", file.name)
+            pass

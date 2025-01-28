@@ -1295,12 +1295,13 @@ def test_validate_api_key_if_hosted(
 ) -> None:
     monkeypatch.delenv("LANGCHAIN_API_KEY", raising=False)
     monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    # TODO: Setting auto_batch_tracing=False for now - requires asyncio loop otherwise
     with pytest.warns(ls_utils.LangSmithMissingAPIKeyWarning):
-        client_cls(api_url="https://api.smith.langchain.com")
+        client_cls(api_url="https://api.smith.langchain.com", auto_batch_tracing=False)
     with warnings.catch_warnings():
         # Check no warning is raised here.
         warnings.simplefilter("error")
-        client_cls(api_url="http://localhost:1984")
+        client_cls(api_url="http://localhost:1984", auto_batch_tracing=False)
 
 
 def test_parse_token_or_url():
